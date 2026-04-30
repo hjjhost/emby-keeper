@@ -5,6 +5,7 @@ from thefuzz import process
 from pyrogram.types import Message
 from pyrogram.errors import RPCError
 
+from ..link import Link
 from . import AnswerBotCheckin
 
 
@@ -28,15 +29,38 @@ class TerminusCheckin(AnswerBotCheckin):
             if len(options) < 2:
                 return
             result = clean(await self.recognize_captcha_text(message))
-            if not result:
-                self.log.warning(f"签到失败: 验证码识别错误.")
-                return await self.fail()
-            matched, score = process.extractOne(result, options_cleaned)
-            if score < 50:
-                self.log.warning(f"本地 OCR 答案难以与可用选项相匹配 (分数: {score}/100).")
+            matched = None
+            score = 0
+            if result:
+                matched, score = process.extractOne(result, options_cleaned)
+            if matched and score >= 50:
+                self.log.debug(f"本地 OCR 解析答案: {matched} (分数: {score}/100).")
+            else:
+                if result:
+                    self.log.warning(f"本地 OCR 答案难以与可用选项相匹配 (分数: {score}/100), 尝试远端解析.")
+                else:
+                    self.log.warning("本地 OCR 未能识别验证码, 尝试远端解析.")
+                matched = await self.remote_visual_answer(message, options_cleaned, clean)
+                if not matched:
+                    self.log.warning(f"签到失败: 验证码识别错误.")
+                    return await self.fail()
             result = options[options_cleaned.index(matched)]
             await asyncio.sleep(random.uniform(0.5, 1.5))
             try:
                 await message.click(result)
             except RPCError:
                 self.log.warning("按钮点击失败.")
+
+    async def remote_visual_answer(self, message: Message, options_cleaned, clean):
+        for i in range(3):
+            result, by = await Link(self.client).visual(message.photo.file_id, options_cleaned)
+            result = clean(result) if result else None
+            if not result:
+                self.log.warning(f"远端解析失败, 正在重试解析 ({i + 1}/3).")
+                continue
+            matched, score = process.extractOne(result, options_cleaned)
+            if score >= 70:
+                self.log.debug(f"已通过远端 ({by}) 解析答案: {matched} (分数: {score}/100).")
+                return matched
+            self.log.warning(f"远端答案难以与可用选项相匹配 (分数: {score}/100), 正在重试 ({i + 1}/3).")
+        return None

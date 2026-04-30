@@ -304,9 +304,15 @@ class Link:
         return None, None
 
     async def visual(self, photo, options: List[str], question=None) -> Tuple[Optional[str], Optional[str]]:
-        """远端视觉问题解答服务已禁用."""
-        self.log.warning("本地模式未配置视觉问题解答服务.")
-        return None, None
+        """向原作者远端服务请求视觉问题解答."""
+        cmd = f"/visual {self.instance} {'/'.join(options)}"
+        if question:
+            cmd += f" {question}"
+        results = await self.post(cmd, photo=photo, timeout=20, name="请求视觉问题解答")
+        if results:
+            return results.get("answer", None), results.get("by", None)
+        else:
+            return None, None
 
     async def ocr(self, photo) -> Optional[str]:
         """远端 OCR 服务已禁用; 签到器应使用本地 OCRService."""
