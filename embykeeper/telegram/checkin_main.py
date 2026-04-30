@@ -360,7 +360,7 @@ class CheckinerManager:
                 if hasattr(c, "templ_name"):
                     site_name = c.templ_name
                 else:
-                    site_name = cls.__module__.rsplit(".", 1)[-1]
+                    site_name = c.__class__.__module__.rsplit(".", 1)[-1]
                 if c.ctx.next_time:
                     self.schedule_site(ctx, c.ctx.next_time, account, site_name, reschedule=True)
                 checked.append(c.name)

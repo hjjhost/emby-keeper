@@ -7,15 +7,21 @@ import base64
 import re
 import atexit
 import os
-import pty
-import select
-import fcntl
 import struct
-from subprocess import Popen, PIPE
-import termios
+import select
+from subprocess import Popen, PIPE, STDOUT
 import threading
 import time
 import signal
+
+try:
+    import fcntl
+    import pty
+    import termios
+except ImportError:
+    fcntl = None
+    pty = None
+    termios = None
 
 import tomlkit
 import typer
@@ -55,6 +61,8 @@ app.config["lock"] = threading.Lock()
 app.config["args"] = []
 app.config["fd"] = None
 app.config["proc"] = None
+app.config["proc_stdin"] = None
+app.config["proc_stdout"] = None
 app.config["hist"] = ""
 app.config["faillog"] = []
 app.config["config"] = ""
@@ -96,7 +104,7 @@ def index():
 
 
 def is_authenticated():
-    webpass = app.config.get("webpass", None)
+    webpass = app.config.get("webpass", None) or os.environ.get("EK_WEBPASS", "")
     if (not webpass) or current_user.is_authenticated:
         return True
     else:
@@ -117,7 +125,7 @@ def login():
 @bp.route("/login", methods=["POST"])
 def login_submit():
     password = request.form.get("password", "")
-    webpass = os.environ.get("EK_WEBPASS", "")
+    webpass = app.config.get("webpass", None) or os.environ.get("EK_WEBPASS", "")
     if not webpass:
         emsg = "后台没有设置控制台密码, 无法登录."
     elif sum(t > time.time() - 3600 for t in app.config["faillog"][-5:]) == 5:
@@ -209,12 +217,17 @@ def pty_input(data):
     if not is_authenticated():
         return
     with app.config["lock"]:
+        i = data["input"].encode()
         if app.config["fd"]:
-            i = data["input"].encode()
             os.write(app.config["fd"], i)
+        elif app.config["proc_stdin"]:
+            app.config["proc_stdin"].write(i)
+            app.config["proc_stdin"].flush()
 
 
 def set_size(fd, row, col, xpix=0, ypix=0):
+    if not (fd and fcntl and termios):
+        return
     logger.debug(f"Resizing pty to: {row} {col}.")
     size = struct.pack("HHHH", row, col, xpix, ypix)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
@@ -262,6 +275,16 @@ def read_and_forward_pty_output():
                         break
             except (select.error, OSError):
                 break
+        elif app.config["proc_stdout"]:
+            try:
+                output = app.config["proc_stdout"].read(max_read_bytes)
+                if not output:
+                    break
+                output = output.decode(errors="ignore")
+                app.config["hist"] += output
+                socketio.emit("pty-output", {"output": output}, namespace="/pty")
+            except OSError:
+                break
         else:
             break
     logger.debug("PTY reader task ended")
@@ -277,26 +300,41 @@ def disconnect_on_proc_exit(proc: Popen):
 
 
 def start_proc(instant=False):
-    master_fd, slave_fd = pty.openpty()
     args = ["embykeeper", *app.config["args"]]
     if instant:
         args.append("--instant")
-    p = Popen(
-        args,
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env={
-            **os.environ,
-            "EK_CONFIG": app.config["config"],
-            "EK_MONGODB": app.config["mongodb"],
-            "TZ": "Asia/Shanghai",
-        },
-        preexec_fn=os.setsid,
-    )
+    env = {
+        **os.environ,
+        "EK_CONFIG": app.config["config"],
+        "EK_MONGODB": app.config["mongodb"],
+        "TZ": "Asia/Shanghai",
+    }
+    if pty:
+        master_fd, slave_fd = pty.openpty()
+        p = Popen(
+            args,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+        )
+        app.config["fd"] = master_fd
+        app.config["proc_stdin"] = None
+        app.config["proc_stdout"] = None
+    else:
+        p = Popen(
+            args,
+            stdin=PIPE,
+            stdout=PIPE,
+            stderr=STDOUT,
+            env=env,
+        )
+        app.config["fd"] = None
+        app.config["proc_stdin"] = p.stdin
+        app.config["proc_stdout"] = p.stdout
     socketio.start_background_task(target=disconnect_on_proc_exit, proc=p)
     atexit.register(exit_handler)
-    app.config["fd"] = master_fd
     app.config["proc"] = p
     logger.debug(f"Embykeeper started at: {p.pid}.")
     socketio.start_background_task(target=read_and_forward_pty_output)
@@ -309,7 +347,7 @@ def start(data, auth=True):
         logger.debug("Authentication failed.")
         return
     with app.config["lock"]:
-        if app.config["fd"] and app.config["proc"] and app.config["proc"].poll() is None:
+        if app.config["proc"] and app.config["proc"].poll() is None:
             logger.debug("Existing process found, resizing and sending history.")
             set_size(app.config["fd"], data["rows"], data["cols"])
             socketio.sleep(0.1)
@@ -375,6 +413,7 @@ def run(
     app.register_blueprint(bp, url_prefix=app.config["BASE_PREFIX"])
     app.config["config"] = os.environ.get("EK_CONFIG", "")
     app.config["mongodb"] = os.environ.get("EK_MONGODB", "")
+    app.config["webpass"] = os.environ.get("EK_WEBPASS", "")
     if app.config["mongodb"]:
         ek_config.set(Config())
         ek_config.mongodb = app.config["mongodb"]

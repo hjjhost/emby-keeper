@@ -133,7 +133,7 @@ class AsyncTaskPool:
                 return await task
 
         t = asyncio.create_task(wrapper())
-        t.set_name(name or coro.__name__)
+        t.set_name(name or getattr(coro, "__name__", coro.__class__.__name__))
         self.tasks.append(t)
         return t
 

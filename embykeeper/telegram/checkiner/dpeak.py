@@ -10,6 +10,9 @@ class DPeakCheckin(TemplateACheckin):
 
     async def message_handler(self, client, message: Message):
         if message.text and "人机验证" in message.text:
+            if self.is_click_captcha_prompt(message):
+                self.remember_click_captcha_message(message)
+                return
             if not await self.gpt_handle_message(message, unexpected=False):
                 self.log.info(f"签到失败: 智能解析错误, 正在重试.")
                 return await self.retry()

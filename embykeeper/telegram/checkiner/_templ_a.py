@@ -74,6 +74,9 @@ class TemplateACheckin(BotCheckin):
 
     async def message_handler(self, client, message: Message):
         text = message.caption or message.text
+        if self.is_click_captcha_prompt(message):
+            self.remember_click_captcha_message(message)
+            return
         if (
             text
             and message.reply_markup

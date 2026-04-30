@@ -37,9 +37,9 @@ class RegisterManager:
 
     def _handle_config_change(self, *args):
         """Handle changes to the register configuration"""
-        # Stop all existing schedulers - collect phones first
+        # Stop all existing schedulers/tasks - collect phones first
         phones = set()
-        for key in self._schedulers.keys():
+        for key in (*self._schedulers.keys(), *self._tasks.keys()):
             if "." in key:
                 phone = key.split(".")[0]
                 phones.add(phone)
@@ -50,15 +50,11 @@ class RegisterManager:
         # Reschedule all accounts with the new configuration
         for account in config.telegram.account:
             if account.enabled and account.registrar:
-                schedulers = self.schedule_account(account)
-                if schedulers:
-                    if isinstance(schedulers, list):
-                        for scheduler in schedulers:
-                            if hasattr(scheduler, "schedule"):
-                                self._pool.add(scheduler.schedule())
-                    else:
-                        # 间隔注册返回的是task, 直接添加
-                        self._pool.add(schedulers)
+                schedulers, tasks = self.schedule_account(account)
+                for scheduler in schedulers:
+                    self._pool.add(scheduler.schedule())
+                for task in tasks:
+                    self._pool.add(task)
 
         logger.info("已根据新的配置重新安排所有注册任务.")
 
@@ -70,15 +66,12 @@ class RegisterManager:
 
         for account in added:
             if account.enabled and account.registrar:
-                schedulers = self.schedule_account(account)
-                if schedulers:
-                    if isinstance(schedulers, list):
-                        for scheduler in schedulers:
-                            if hasattr(scheduler, "schedule"):
-                                self._pool.add(scheduler.schedule())
-                    else:
-                        # 间隔注册返回的是task, 直接添加
-                        self._pool.add(schedulers)
+                schedulers, tasks = self.schedule_account(account)
+                for scheduler in schedulers:
+                    self._pool.add(scheduler.schedule())
+                for task in tasks:
+                    self._pool.add(task)
+                if schedulers or tasks:
                     logger.info(f"新增的 {account.phone} 账号的注册计划任务已增加.")
 
     def stop_account(self, phone: str):
@@ -119,8 +112,7 @@ class RegisterManager:
     def schedule_account(self, account: TelegramAccount) -> tuple[List[Scheduler], List[asyncio.Task]]:
         """为单个账户安排注册任务"""
         phone = account.phone
-        if phone in self._schedulers or phone in self._tasks:
-            self.stop_account(phone)
+        self.stop_account(phone)
 
         # 获取此账户启用的站点
         sites_to_register_names = self.get_sites_for_account(account)
@@ -147,8 +139,7 @@ class RegisterManager:
 
             if site_config.get("times"):
                 # 定时模式
-                scheduler = self._schedule_site_timed(account, site_name, site_config)
-                schedulers.append(scheduler)
+                schedulers.extend(self._schedule_site_timed(account, site_name, site_config))
             elif site_config.get("interval_minutes"):
                 # 间隔模式
                 task = self._schedule_site_interval(account, site_name, site_config)
@@ -160,10 +151,6 @@ class RegisterManager:
         """定时注册模式"""
         phone_masked = TelegramAccount.get_phone_masked(account.phone)
         times = site_config.get("times", [])
-
-        # 将时间列表转换为时间范围格式
-        times_str = ",".join(times)
-        time_range = f"<{times_str}>"
 
         def on_next_time(t: datetime):
             logger.info(
@@ -179,22 +166,23 @@ class RegisterManager:
 
         def func(ctx: RunContext):
             task = asyncio.create_task(self._run_single_site(ctx, account, site_name, site_config))
-            log = logger.bind(username=f"@{site_name}", name=f"{phone_masked}")
-            log.info(f"已计划定时抢注任务, 下次运行: {scheduler.next_run.strftime('%Y-%m-%d %H:%M:%S')}")
             return task
 
-        scheduler = Scheduler.from_str(
-            func=func,
-            interval_days="1",  # 每天执行
-            time_range=time_range,
-            on_next_time=on_next_time,
-            description=f"{account.phone} 账号 {site_name} 站点定时注册任务",
-            sid=f"registrar.timed.{account.phone}.{site_name}",
-        )
+        schedulers = []
+        for index, time_text in enumerate(times):
+            scheduler = Scheduler.from_str(
+                func=func,
+                interval_days="1",  # 每天执行
+                time_range=time_text,
+                on_next_time=on_next_time,
+                description=f"{account.phone} 账号 {site_name} 站点定时注册任务",
+                sid=f"registrar.timed.{account.phone}.{site_name}.{index}",
+            )
 
-        scheduler_key = f"{account.phone}.{site_name}"
-        self._schedulers[scheduler_key] = scheduler
-        return scheduler
+            scheduler_key = f"{account.phone}.{site_name}.{index}"
+            self._schedulers[scheduler_key] = scheduler
+            schedulers.append(scheduler)
+        return schedulers
 
     def _schedule_site_interval(self, account: TelegramAccount, site_name: str, site_config: dict):
         """间隔注册模式"""

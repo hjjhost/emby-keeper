@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from enum import Flag, auto
 import string
 import time
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 from loguru import logger
 from pyrogram import filters
@@ -24,7 +24,7 @@ from pyrogram.handlers import EditedMessageHandler, MessageHandler
 from pyrogram.types import InlineKeyboardMarkup, Message, ReplyKeyboardMarkup
 from pyrogram.raw.functions.account import GetNotifySettings
 from pyrogram.raw.types import PeerNotifySettings, InputNotifyPeer
-from thefuzz import fuzz, process
+from thefuzz import fuzz
 
 from embykeeper import __name__ as __product__
 from embykeeper.ocr import CharRange, OCRService
@@ -192,6 +192,7 @@ class BotCheckin(BaseBotCheckin):
         self._waiting = {}  # 当前等待的消息
         self._first_waiting = False  # 是否在等待首个消息
         self._handler_tasks = set()  # 存储所有正在运行的 message_handler 任务
+        self._pending_click_captcha_message: Optional[Message] = None
         if instant:
             self.checked_retries = None
 
@@ -488,6 +489,9 @@ class BotCheckin(BaseBotCheckin):
                 if re.search(p, text):
                     k.set()
                     self._waiting[p] = message
+        if self.is_click_captcha_prompt(message):
+            self.remember_click_captcha_message(message)
+            return
         type = type or self.message_type(message)
         if type:
             if MessageType.TEXT in type:
@@ -500,6 +504,8 @@ class BotCheckin(BaseBotCheckin):
     def message_type(self, message: Message):
         """分析传入消息的类型为验证码或文字."""
         if message.photo:
+            if self._pending_click_captcha_message:
+                return MessageType.CAPTCHA
             if message.caption:
                 if self.bot_use_captcha:
                     if self.bot_checkin_caption_pat:
@@ -523,38 +529,145 @@ class BotCheckin(BaseBotCheckin):
 
     async def on_photo(self, message: Message):
         """分析传入的验证码图片并返回验证码."""
-        data = await self.client.download_media(message, in_memory=True)
-        ocr = await OCRService.get(
-            ocr_name=self.ocr,
-            char_range=self.bot_captcha_char_range,
-        )
-
         try:
-            with ocr:
-                is_gif = getattr(data, "name", "").endswith(".gif")
-                ocr_text = await ocr.run(data, gif=is_gif)
-                if not ocr_text:
-                    self.log.info(f"签到失败: 接收到空验证码, 正在重试.")
-                    await self.retry()
-                    return
-
-                captcha = ocr_text.translate(str.maketrans("", "", string.punctuation)).replace(" ", "")
-
-            if captcha:
-                self.log.debug(f"[gray50]接收验证码: {captcha}.[/]")
-                if self.bot_captcha_len and len(captcha) not in to_iterable(self.bot_captcha_len):
-                    self.log.info(f"签到失败: 验证码低于设定长度, 正在重试.")
-                    await self.retry()
-                else:
-                    await asyncio.sleep(random.uniform(2, 4))
-                    await self.on_captcha(message, captcha)
-            else:
-                self.log.info(f"签到失败: 接收到空验证码, 正在重试.")
-                await self.retry()
+            captcha = await self.recognize_captcha_text(message)
         except asyncio.TimeoutError:
             self.log.info("签到失败: 验证码识别失败, 正在重试.")
             await self.retry()
             return
+
+        if captcha:
+            self.log.debug(f"[gray50]接收验证码: {captcha}.[/]")
+            if self.bot_captcha_len and len(captcha) not in to_iterable(self.bot_captcha_len):
+                self.log.info(f"签到失败: 验证码低于设定长度, 正在重试.")
+                await self.retry()
+            else:
+                await asyncio.sleep(random.uniform(2, 4))
+                await self.on_captcha(message, captcha)
+        else:
+            self.log.info(f"签到失败: 接收到空验证码, 正在重试.")
+            await self.retry()
+
+    async def recognize_captcha_text(self, message: Message) -> str:
+        """使用本地 OCRService 识别验证码图片并返回清理后的文本."""
+        data = await self.client.download_media(message, in_memory=True)
+        char_range = self.get_click_captcha_char_range() or self.bot_captcha_char_range
+        ocr = await OCRService.get(
+            ocr_name=self.ocr,
+            char_range=char_range,
+        )
+
+        with ocr:
+            is_gif = getattr(data, "name", "").endswith(".gif")
+            ocr_text = await ocr.run(data, gif=is_gif)
+            if not ocr_text:
+                return ""
+            return ocr_text.translate(str.maketrans("", "", string.punctuation)).replace(" ", "")
+
+    def get_button_texts(self, message: Message) -> List[str]:
+        """获取消息上的所有按钮文本."""
+        reply_markup = message.reply_markup
+        if isinstance(reply_markup, InlineKeyboardMarkup):
+            return [k.text for r in reply_markup.inline_keyboard for k in r if k.text]
+        if isinstance(reply_markup, ReplyKeyboardMarkup):
+            return [k.text for r in reply_markup.keyboard for k in r if k.text]
+        return []
+
+    def is_click_captcha_prompt(self, message: Message) -> bool:
+        """判断消息是否是“看图点击按钮”类验证码提示."""
+        text = message.text or message.caption or ""
+        if not text or not message.reply_markup:
+            return False
+        buttons = self.get_button_texts(message)
+        if not buttons:
+            return False
+        prompt_keywords = (
+            "请点击",
+            "請點擊",
+            "图片中显示",
+            "圖片中顯示",
+            "图中",
+            "圖中",
+            "签到验证",
+            "簽到驗證",
+            "人机验证",
+            "人機驗證",
+            "数字",
+            "數字",
+        )
+        if not any(keyword in text for keyword in prompt_keywords):
+            return False
+        return any(not self._is_back_button(button) for button in buttons)
+
+    def remember_click_captcha_message(self, message: Message):
+        """缓存带按钮的验证消息, 等待随后到来的图片验证码."""
+        self._pending_click_captcha_message = message
+        self.log.debug("已记录图片点击验证码按钮消息, 等待验证码图片.")
+
+    @staticmethod
+    def _normalize_captcha_choice(value: str) -> str:
+        return re.sub(r"[\W_]+", "", str(value or ""), flags=re.UNICODE).lower()
+
+    @staticmethod
+    def _is_back_button(value: str) -> bool:
+        return any(keyword in str(value or "") for keyword in ("返回", "取消", "退出", "关闭", "關閉"))
+
+    def get_click_captcha_choices(self, message: Message) -> List[Tuple[str, str]]:
+        choices = [
+            (button, self._normalize_captcha_choice(button))
+            for button in self.get_button_texts(message)
+            if not self._is_back_button(button)
+        ]
+        return [(button, normalized) for button, normalized in choices if normalized]
+
+    def get_click_captcha_char_range(self) -> Optional[str]:
+        if not self._pending_click_captcha_message:
+            return None
+        choices = self.get_click_captcha_choices(self._pending_click_captcha_message)
+        normalized = [normalized for _, normalized in choices]
+        if normalized and all(len(choice) == 1 for choice in normalized):
+            return "".join(dict.fromkeys("".join(normalized)))
+        return None
+
+    async def click_captcha_button(self, message: Message, captcha: str) -> bool:
+        """用 OCR 结果点击同消息或已缓存消息上的按钮."""
+        target = self._pending_click_captcha_message or (message if message.reply_markup else None)
+        if not target:
+            return False
+        captcha_norm = self._normalize_captcha_choice(captcha)
+        if not captcha_norm:
+            return False
+        choices = self.get_click_captcha_choices(target)
+        if not choices:
+            return False
+
+        single_char_matches = [
+            button for button, normalized in choices if len(normalized) == 1 and normalized in captcha_norm
+        ]
+        exact = [button for button, normalized in choices if normalized == captcha_norm]
+        contains = [button for button, normalized in choices if captcha_norm in normalized]
+        if exact:
+            button = exact[0]
+        elif len(single_char_matches) == 1:
+            button = single_char_matches[0]
+        elif contains:
+            button = contains[0]
+        else:
+            button, score = max(
+                ((button, fuzz.ratio(normalized, captcha_norm)) for button, normalized in choices),
+                key=lambda item: item[1],
+            )
+            if score < 75:
+                self.log.info(f'未能找到对应 "{captcha}" 的验证码按钮, 正在重试.')
+                return False
+
+        try:
+            await target.click(button)
+        except (TimeoutError, MessageIdInvalid, DataInvalid):
+            pass
+        self._pending_click_captcha_message = None
+        self.log.info(f'本地 OCR 点击了验证码按钮 "{button}".')
+        return True
 
     async def on_captcha(self, message: Message, captcha: str):
         """
@@ -562,6 +675,11 @@ class BotCheckin(BaseBotCheckin):
             message: 包含验证码图片的消息
             captcha: OCR 识别的验证码
         """
+        if await self.click_captcha_button(message, captcha):
+            return
+        if self._pending_click_captcha_message:
+            await self.retry()
+            return
         await message.reply(captcha)
 
     async def on_text(self, message: Message, text: str):
@@ -619,13 +737,14 @@ class BotCheckin(BaseBotCheckin):
         return await self.gpt_handle_message(message, unexpected=True)
 
     async def gpt_handle_message(self, message: Message, unexpected: bool = True):
+        """本地启发式处理异常消息, 不再调用远端 GPT 服务."""
         content = message.text or message.caption
         if content:
             spec = content.replace("\n", " ")
             if unexpected:
-                self.log.warning(f"接收到异常返回信息: {spec}, 正在尝试智能回答.")
+                self.log.warning(f"接收到异常返回信息: {spec}, 正在尝试本地规则处理.")
             else:
-                self.log.info(f"正在使用智能接口回答问题.")
+                self.log.info(f"正在使用本地规则回答问题.")
             if (
                 message.reply_markup
                 and isinstance(message.reply_markup, InlineKeyboardMarkup)
@@ -634,101 +753,77 @@ class BotCheckin(BaseBotCheckin):
                 buttons = [b.text for r in message.reply_markup.inline_keyboard for b in r]
             else:
                 buttons = []
-            button_specs = [f"'{b}'" for b in buttons]
-            prompt = (
-                "我正在进行签到, 机器将显示指令或状态, 我需要通过回答问题以避免被识别为机器人或自动化程序, 并希望完成签到, 现在机器给出的值为:\n\n"
-                f"{content}\n\n"
-            )
+
             if buttons:
-                prompt += (
-                    f"你可选: {', '.join(button_specs)} 中的一个作为回答.\n"
-                    "形式为: [CLICK]^XXX^, 其中XXX为回答\n"
+                button_specs = [f"'{b}'" for b in buttons]
+                self.log.debug(f"当前按钮: {', '.join(button_specs)}")
+                positive_keywords = (
+                    "签到",
+                    "簽到",
+                    "打卡",
+                    "开始",
+                    "開始",
+                    "验证",
+                    "驗證",
+                    "继续",
+                    "繼續",
+                    "确认",
+                    "確認",
+                    "确定",
+                    "確定",
+                    "提交",
+                    "下一步",
+                    "领取",
+                    "領取",
                 )
-            prompt += (
-                "如果您认为不应该进行任何操作, 请输出 [NO_RESP], 禁止输出其他内容.\n"
-                "如果这是一个指令, 请输出您需要发送或点击的内容.\n"
-                "形式为: [SEND]^XXX^, 其中XXX为内容\n"
-                "不要说明这是一个指令, 不要说明需要发送文本消息, 仅仅按上述形式输出.\n"
-                "如果这是一个状态, 请输出 [IS_STATUS], 禁止输出其他内容."
-            )
-            for _ in range(3):
-                answer, by = await Link(self.client).gpt(prompt)
-                if answer:
-                    self.log.debug(f"智能回答 ({by}): {answer}")
-                    if "[NO_RESP]" in answer:
-                        if unexpected:
-                            self.log.info(f"智能回答认为无需进行操作, 为了避免风险签到器将停止.")
-                            await self.fail()
-                            return False
-                        else:
-                            self.log.info(f"智能回答认为无需进行操作.")
-                            return True
-                    elif "[IS_STATUS]" in answer:
-                        if unexpected:
-                            self.log.info(
-                                f"智能回答认为这是一条状态信息, 无需进行操作, 为了避免风险签到器将停止."
-                            )
-                            await self.fail()
-                            return False
-                        else:
-                            self.log.info(f"智能回答认为这是一条状态信息, 无需进行操作.")
-                            return True
-                    elif buttons and "[CLICK]" in answer:
-                        self.log.debug(f"当前按钮: {', '.join(button_specs)}")
-                        answer_content = re.search(r"\[CLICK\]\^(.+?)\^", answer)
-                        if not answer_content:
-                            if unexpected:
-                                self.log.info(f"智能回答失败, 为了避免风险签到器将停止.")
-                                await self.fail()
-                                return False
-                            else:
-                                self.log.warning(f"智能回答失败.")
-                                return False
-                        answer_content = answer_content.group(1)
-                        b, s = process.extractOne(answer_content, buttons, scorer=fuzz.partial_ratio)
-                        if s < 70:
-                            self.log.info(f"找不到对应回答的按钮, 正在重试.")
-                            await asyncio.sleep(3)
-                            continue
-                        else:
-                            try:
-                                await message.click(b)
-                            except (TimeoutError, MessageIdInvalid):
-                                pass
-                            if unexpected:
-                                self.log.warning(f'智能回答点击了按钮 "{b}", 为了避免风险签到器将停止.')
-                                await self.fail()
-                                return False
-                            else:
-                                self.log.info(f'智能回答点击了按钮 "{b}".')
-                                return True
-                    elif "[SEND]" in answer:
-                        answer_content = re.search(r"\[SEND\]\^(.+?)\^", answer)
-                        if not answer_content:
-                            if unexpected:
-                                self.log.warning(f"智能回答失败, 为了避免风险签到器将停止.")
-                                await self.fail()
-                                return False
-                            else:
-                                self.log.warning(f"智能回答失败.")
-                                return False
-                        answer_content = answer_content.group(1)
-                        await message.reply(answer_content)
-                        if unexpected:
-                            self.log.warning(f'智能回答回复了 "{answer_content}", 为了避免风险签到器将停止.')
-                            await self.fail()
-                            return False
-                        else:
-                            self.log.info(f'智能回答回复了 "{answer_content}".')
-                            return True
+                negative_keywords = ("取消", "退出", "关闭", "關閉", "结束", "結束", "失败", "錯誤", "错误")
+                for button in buttons:
+                    if any(k in button for k in negative_keywords):
+                        continue
+                    if any(k in button for k in positive_keywords):
+                        try:
+                            await message.click(button)
+                        except (TimeoutError, MessageIdInvalid):
+                            pass
+                        self.log.info(f'本地规则点击了按钮 "{button}".')
+                        return True
+
+            answer = self._solve_local_text_challenge(content)
+            if answer:
+                await message.reply(answer)
+                self.log.info(f'本地规则回复了 "{answer}".')
+                return True
+
+            if unexpected:
+                self.log.warning(f"本地规则无法处理该消息, 为了避免风险签到器将停止.")
+                await self.fail()
+                return False
             else:
-                if unexpected:
-                    self.log.warning(f"智能回答失败, 为了避免风险签到器将停止.")
-                    await self.fail()
-                    return False
-                else:
-                    self.log.warning(f"智能回答失败.")
-                    return False
+                self.log.warning(f"本地规则无法处理该消息.")
+                return False
+
+    def _solve_local_text_challenge(self, content: str) -> Optional[str]:
+        """处理简单文本算术题."""
+        if not content:
+            return None
+        normalized = content.replace("＋", "+").replace("－", "-").replace("×", "*").replace("x", "*")
+        normalized = normalized.replace("X", "*").replace("÷", "/").replace("／", "/")
+        match = re.search(r"(-?\d+)\s*([+\-*/])\s*(-?\d+)", normalized)
+        if not match:
+            return None
+        left, op, right = match.groups()
+        left = int(left)
+        right = int(right)
+        if op == "+":
+            return str(left + right)
+        if op == "-":
+            return str(left - right)
+        if op == "*":
+            return str(left * right)
+        if op == "/" and right:
+            result = left / right
+            return str(int(result)) if result.is_integer() else str(result)
+        return None
 
     async def retry(self):
         """执行重试, 重新发送签到指令."""

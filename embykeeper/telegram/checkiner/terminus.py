@@ -1,10 +1,10 @@
 import asyncio
 import random
 import emoji
+from thefuzz import process
 from pyrogram.types import Message
 from pyrogram.errors import RPCError
 
-from ..link import Link
 from . import AnswerBotCheckin
 
 
@@ -19,7 +19,7 @@ class TerminusCheckin(AnswerBotCheckin):
     bot_use_history = 3
 
     async def on_photo(self, message: Message):
-        """分析分析传入的验证码图片并返回验证码."""
+        """使用本地 OCR 分析验证码图片并点击匹配选项."""
         if message.reply_markup:
             clean = lambda o: emoji.replace_emoji(o, "").replace(" ", "")
             keys = [k for r in message.reply_markup.inline_keyboard for k in r]
@@ -27,17 +27,14 @@ class TerminusCheckin(AnswerBotCheckin):
             options_cleaned = [clean(o) for o in options]
             if len(options) < 2:
                 return
-            for i in range(3):
-                result, by = await Link(self.client).visual(message.photo.file_id, options_cleaned)
-                if result:
-                    self.log.debug(f"已通过远端 ({by}) 解析答案: {result}.")
-                    break
-                else:
-                    self.log.warning(f"远端解析失败, 正在重试解析 ({i + 1}/3).")
-            else:
+            result = clean(await self.recognize_captcha_text(message))
+            if not result:
                 self.log.warning(f"签到失败: 验证码识别错误.")
                 return await self.fail()
-            result = options[options_cleaned.index(result)]
+            matched, score = process.extractOne(result, options_cleaned)
+            if score < 50:
+                self.log.warning(f"本地 OCR 答案难以与可用选项相匹配 (分数: {score}/100).")
+            result = options[options_cleaned.index(matched)]
             await asyncio.sleep(random.uniform(0.5, 1.5))
             try:
                 await message.click(result)

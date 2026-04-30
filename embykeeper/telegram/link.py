@@ -2,7 +2,6 @@ import asyncio
 import random
 from typing import Callable, Coroutine, List, Optional, Tuple, Union
 import uuid
-from io import BytesIO
 
 import tomli
 from loguru import logger
@@ -225,35 +224,15 @@ class Link:
                 message.continue_propagation()
 
     async def auth(self, service: str, log_func=None):
-        """向机器人发送授权请求."""
+        """本地自用版授权: 所有服务直接放行, 不再请求远端 Auth Bot."""
         async with authed_services_lock:
             user_auth_cache = authed_services.get(self.client.me.id, {}).get(service, None)
             if user_auth_cache is not None:
                 return user_auth_cache
 
-            # No cache, perform auth
-            if not log_func:
-                result = await self.post(
-                    f"/auth {service} {self.instance}", name=f"服务 {service.upper()} 认证"
-                )
-                authed_services.setdefault(self.client.me.id, {})[service] = bool(result)
-                return bool(result)
-            else:
-                try:
-                    await self.post(
-                        f"/auth {service} {self.instance}",
-                        name=f"服务 {service.upper()} 认证",
-                        fail=True,
-                    )
-                except LinkError as e:
-                    log_func(f"初始化错误: 使用 {service.upper()} 服务, 但{e}")
-                    if "权限不足" in str(e):
-                        await self._show_super_ad()
-                    authed_services.setdefault(self.client.me.id, {})[service] = False
-                    return False
-                else:
-                    authed_services.setdefault(self.client.me.id, {})[service] = True
-                    return True
+            self.log.debug(f"本地授权模式: 服务 {service.upper()} 已放行.")
+            authed_services.setdefault(self.client.me.id, {})[service] = True
+            return True
 
     async def _show_super_ad(self):
         async with super_ad_shown_lock:
@@ -266,7 +245,7 @@ class Link:
                 return False
 
     async def captcha(self, site: str, url: str = None) -> Optional[str]:
-        """向机器人发送验证码解析请求."""
+        """向原作者远端服务请求 Turnstile/CF token."""
         cmd = f"/captcha {self.instance} {site}"
         if url:
             cmd += f" {url}"
@@ -277,7 +256,7 @@ class Link:
             return None
 
     async def captcha_content(self, site: str, url: str = None) -> Optional[str]:
-        """向机器人发送带验证码的远程网页解析请求."""
+        """向原作者远端服务请求带验证码的网页内容解析."""
         cmd = f"/captcha {self.instance} {site}"
         if url:
             cmd += f" {url}"
@@ -288,7 +267,7 @@ class Link:
             return None
 
     async def wssocks(self) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送逆向 Socks 代理隧道监听请求."""
+        """向原作者远端服务请求逆向 Socks 代理隧道."""
         cmd = f"/wssocks {self.instance}"
         results = await self.post(cmd, timeout=20, name="请求新建代理隧道以跳过验证码")
         if results:
@@ -299,7 +278,7 @@ class Link:
     async def captcha_wssocks(
         self, token: str, url: str, user_agent: Optional[str] = None
     ) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送通过代理隧道进行验证码解析请求."""
+        """向原作者远端服务请求代理隧道验证码解析."""
         cmd = f"/captcha_wssocks {self.instance} {token} {url}"
         if user_agent:
             cmd += f" {user_agent}"
@@ -310,72 +289,41 @@ class Link:
             return None, None
 
     async def pornemby_answer(self, question: str) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送问题回答请求."""
-        results = await self.post(
-            f"/pornemby_answer {self.instance} {question}", timeout=20, name="请求问题回答"
-        )
-        if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+        """远端 Pornemby 问答服务已禁用."""
+        self.log.warning("本地模式未配置 Pornemby 问答服务.")
+        return None, None
 
     async def terminus_answer(self, question: str) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送问题回答请求."""
-        results = await self.post(
-            f"/terminus_answer {self.instance} {question}", timeout=20, name="请求问题回答"
-        )
-        if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+        """远端 Terminus 问答服务已禁用."""
+        self.log.warning("本地模式未配置 Terminus 问答服务.")
+        return None, None
 
     async def gpt(self, prompt: str) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送智能回答请求."""
-        results = await self.post(f"/gpt {self.instance} {prompt}", timeout=40, name="请求智能回答")
-        if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+        """远端智能回答服务已禁用."""
+        self.log.warning("本地模式未配置智能回答服务.")
+        return None, None
 
     async def visual(self, photo, options: List[str], question=None) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送视觉问题解答请求."""
-        cmd = f"/visual {self.instance} {'/'.join(options)}"
-        if question:
-            cmd += f" {question}"
-        results = await self.post(cmd, photo=photo, timeout=20, name="请求视觉问题解答")
-        if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+        """远端视觉问题解答服务已禁用."""
+        self.log.warning("本地模式未配置视觉问题解答服务.")
+        return None, None
 
     async def ocr(self, photo) -> Optional[str]:
-        """向机器人发送 OCR 解答请求."""
-        cmd = f"/ocr {self.instance}"
-        results = await self.post(cmd, photo=photo, timeout=20, name="请求验证码解答")
-        if results:
-            return results.get("answer", None)
-        else:
-            return None
+        """远端 OCR 服务已禁用; 签到器应使用本地 OCRService."""
+        self.log.warning("本地模式未配置远端 OCR 服务.")
+        return None
 
     async def send_log(self, message):
-        """向机器人发送日志记录请求."""
+        """向原项目通知通道发送日志记录请求."""
         results = await self.post(f"/log {self.instance} {message}", name="发送日志到 Telegram ")
         return bool(results)
 
     async def send_msg(self, message):
-        """向机器人发送即时日志记录请求."""
+        """向原项目通知通道发送即时日志记录请求."""
         results = await self.post(f"/msg {self.instance} {message}", name="发送即时日志到 Telegram ")
         return bool(results)
 
     async def infer(self, prompt: str) -> Tuple[Optional[str], Optional[str]]:
-        """向机器人发送话术推测记录请求."""
-        bio = BytesIO()
-        bio.write(prompt.encode("utf-8"))
-        bio.seek(0)
-        bio.name = "data.txt"
-
-        results = await self.post(f"/infer {self.instance}", timeout=120, file=bio, name="发送话术推测请求")
-        if results:
-            return results.get("answer", None), results.get("by", None)
-        else:
-            return None, None
+        """远端话术推测服务已禁用."""
+        self.log.warning("本地模式未配置话术推测服务.")
+        return None, None

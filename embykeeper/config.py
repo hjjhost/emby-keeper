@@ -582,7 +582,10 @@ class ConfigManager(ProxyBase):
         cfg_dict = {}
         env_config = os.environ.get(f"EK_CONFIG", None)
         if env_config:
-            cfg_dict.update(self.load_config_str(env_config))
+            env_cfg = self.load_config_str(env_config)
+            if env_cfg is None:
+                return False
+            cfg_dict.update(env_cfg)
         else:
             if self.windows:
                 default_conf_file = self.basedir / "config.toml"
@@ -632,6 +635,9 @@ class ConfigManager(ProxyBase):
                 self._conf_file = conf_file
                 await self.start_observer()
             return True
+
+        self.set(cfg_model)
+        return True
 
 
 class CallbackHandle:

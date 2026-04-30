@@ -105,8 +105,8 @@ class SubsonicManager:
             )
             scheduler = Scheduler.from_str(
                 func=lambda ctx: self._listen_main(unified_accounts, instant),
-                interval_days=config.emby.interval_days,
-                time_range=config.emby.time_range,
+                interval_days=config.subsonic.interval_days,
+                time_range=config.subsonic.time_range,
                 on_next_time=on_next_time,
                 sid="subsonic.watch.global",
                 description="Subsonic 保活任务",
@@ -116,8 +116,8 @@ class SubsonicManager:
         # Schedule individual site accounts
         for account in independent_accounts:
             account_spec = self.get_spec(account)
-            time_range = account.time_range or config.emby.time_range
-            interval = account.interval_days or config.emby.interval_days
+            time_range = account.time_range or config.subsonic.time_range
+            interval = account.interval_days or config.subsonic.interval_days
 
             # 创建一个函数来生成 on_next_time 回调, 确保每个账号都有自己的 account_spec
             def make_on_next_time(spec):
@@ -126,7 +126,7 @@ class SubsonicManager:
                 )
 
             scheduler = Scheduler.from_str(
-                func=lambda ctx: self._watch_main([account], False),
+                func=lambda ctx, a=account: self._listen_main([a], instant),
                 interval_days=interval,
                 time_range=time_range,
                 on_next_time=make_on_next_time(account_spec),  # 使用工厂函数创建回调
