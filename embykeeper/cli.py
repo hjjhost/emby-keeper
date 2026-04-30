@@ -521,6 +521,7 @@ async def main(
             subsonic_man = SubsonicManager()
 
         pool = AsyncTaskPool()
+        streams = None
 
         if registrar_bot:
             logger.info(f"开始快速注册 @{registrar_bot}")
