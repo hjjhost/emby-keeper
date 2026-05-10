@@ -39,6 +39,7 @@ from pyrogram.handlers import (
     ConnectHandler,
 )
 from pyrogram.storage.sqlite_storage import SQLiteStorage, TEST, PROD
+from pyrogram.session.session import Session as PyrogramSession
 from pyrogram.handlers.handler import Handler
 
 from embykeeper import var, __name__ as __product__, __version__
@@ -65,6 +66,22 @@ pyrogram_session_logger = logging.getLogger("pyrogram")
 for h in pyrogram_session_logger.handlers[:]:
     pyrogram_session_logger.removeHandler(h)
 pyrogram_session_logger.addHandler(LogRedirector())
+
+
+_original_session_restart = PyrogramSession.restart
+
+
+async def _safe_session_restart(self):
+    try:
+        return await _original_session_restart(self)
+    except sqlite3.ProgrammingError as e:
+        if "closed database" in str(e).lower():
+            logger.debug("忽略 Telegram 会话重启期间的已关闭数据库异常.")
+            return
+        raise
+
+
+PyrogramSession.restart = _safe_session_restart
 
 
 class Dispatcher(dispatcher.Dispatcher):
@@ -574,6 +591,9 @@ class Client(pyrogram.Client):
     async def handle_updates(self, updates):
         try:
             return await super().handle_updates(updates)
+        except TimeoutError as e:
+            logger.warning(f"Telegram 更新同步超时: {e}")
+            return
         except OSError as e:
             logger.warning(f"与 Telegram 服务器连接错误: {e}")
             raise
